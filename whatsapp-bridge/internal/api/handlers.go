@@ -902,7 +902,7 @@ func (s *Server) handleCreatePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.client.CreatePoll(req.ChatJID, req.Question, req.Options, req.MultiSelect)
+	result, err := s.client.CreatePoll(s.messageStore, req.ChatJID, req.Question, req.Options, req.MultiSelect)
 	if err != nil {
 		SendJSONError(w, fmt.Sprintf("Failed to create poll: %v", err), http.StatusInternalServerError)
 		return
