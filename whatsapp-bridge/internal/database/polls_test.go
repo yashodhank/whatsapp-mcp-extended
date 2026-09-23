@@ -1,6 +1,9 @@
 package database
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestStoreAndGetPollOptions(t *testing.T) {
 	tests := []struct {
@@ -116,5 +119,131 @@ func TestPollOptionsAreScopedByChat(t *testing.T) {
 	}
 	if len(gotB) != 1 || gotB[0] != "B1" {
 		t.Errorf("chatB options = %v, want [B1]", gotB)
+	}
+}
+
+func TestUpsertPollCurrentVoteCreatesAndOverwrites(t *testing.T) {
+	store := newTestMessageStore(t)
+	const pollID, chatJID, voter = "POLL1", "chat@s.whatsapp.net", "voter@s.whatsapp.net"
+
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, []string{"A"}, 1000); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	votes, err := store.GetPollCurrentVotes(pollID, chatJID)
+	if err != nil {
+		t.Fatalf("GetPollCurrentVotes: %v", err)
+	}
+	if len(votes) != 1 || !reflect.DeepEqual(votes[0].SelectedOptions, []string{"A"}) {
+		t.Fatalf("after first vote, got %+v, want one vote for [A]", votes)
+	}
+
+	// A newer vote from the same voter overwrites — doesn't add a second row.
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, []string{"B"}, 2000); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	votes, err = store.GetPollCurrentVotes(pollID, chatJID)
+	if err != nil {
+		t.Fatalf("GetPollCurrentVotes after change: %v", err)
+	}
+	if len(votes) != 1 {
+		t.Fatalf("expected still exactly 1 row after a vote change, got %d", len(votes))
+	}
+	if !reflect.DeepEqual(votes[0].SelectedOptions, []string{"B"}) {
+		t.Errorf("selected options = %v, want [B]", votes[0].SelectedOptions)
+	}
+}
+
+func TestUpsertPollCurrentVoteRejectsOutOfOrderDelivery(t *testing.T) {
+	store := newTestMessageStore(t)
+	const pollID, chatJID, voter = "POLL1", "chat@s.whatsapp.net", "voter@s.whatsapp.net"
+
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, []string{"Newer"}, 5000); err != nil {
+		t.Fatalf("newer vote: %v", err)
+	}
+	// A vote with an OLDER timestamp arriving after (e.g. redelivered, or a network reorder)
+	// must not overwrite the newer one — enforced atomically by the SQL itself, not by the
+	// caller checking first, which would be a race under concurrent delivery.
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, []string{"OlderShouldBeIgnored"}, 1000); err != nil {
+		t.Fatalf("older vote (should be silently ignored, not error): %v", err)
+	}
+
+	votes, err := store.GetPollCurrentVotes(pollID, chatJID)
+	if err != nil {
+		t.Fatalf("GetPollCurrentVotes: %v", err)
+	}
+	if len(votes) != 1 || !reflect.DeepEqual(votes[0].SelectedOptions, []string{"Newer"}) {
+		t.Fatalf("expected the newer vote to survive, got %+v", votes)
+	}
+	if votes[0].VoteTimestampMS != 5000 {
+		t.Errorf("vote_timestamp_ms = %d, want 5000 (unchanged)", votes[0].VoteTimestampMS)
+	}
+}
+
+func TestUpsertPollCurrentVoteRetractionIsExplicitNotDeletion(t *testing.T) {
+	store := newTestMessageStore(t)
+	const pollID, chatJID, voter = "POLL1", "chat@s.whatsapp.net", "voter@s.whatsapp.net"
+
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, []string{"A"}, 1000); err != nil {
+		t.Fatalf("initial vote: %v", err)
+	}
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, voter, nil, 2000); err != nil {
+		t.Fatalf("retraction: %v", err)
+	}
+
+	votes, err := store.GetPollCurrentVotes(pollID, chatJID)
+	if err != nil {
+		t.Fatalf("GetPollCurrentVotes: %v", err)
+	}
+	if len(votes) != 1 {
+		t.Fatalf("expected the voter's row to still exist after retraction (not deleted), got %d rows", len(votes))
+	}
+	if len(votes[0].SelectedOptions) != 0 {
+		t.Errorf("selected options after retraction = %v, want empty", votes[0].SelectedOptions)
+	}
+}
+
+func TestPollCurrentVotesIsolatedPerVoter(t *testing.T) {
+	store := newTestMessageStore(t)
+	const pollID, chatJID = "POLL1", "group@g.us"
+
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, "alice@s.whatsapp.net", []string{"A"}, 1000); err != nil {
+		t.Fatalf("alice's vote: %v", err)
+	}
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, "bob@s.whatsapp.net", []string{"B"}, 1000); err != nil {
+		t.Fatalf("bob's vote: %v", err)
+	}
+	// Bob changes his mind; must not touch Alice's row.
+	if err := store.UpsertPollCurrentVote(pollID, chatJID, "bob@s.whatsapp.net", []string{"C"}, 2000); err != nil {
+		t.Fatalf("bob's second vote: %v", err)
+	}
+
+	votes, err := store.GetPollCurrentVotes(pollID, chatJID)
+	if err != nil {
+		t.Fatalf("GetPollCurrentVotes: %v", err)
+	}
+	if len(votes) != 2 {
+		t.Fatalf("expected 2 independent voters, got %d (%+v)", len(votes), votes)
+	}
+	byVoter := map[string][]string{}
+	for _, v := range votes {
+		byVoter[v.VoterJID] = v.SelectedOptions
+	}
+	if !reflect.DeepEqual(byVoter["alice@s.whatsapp.net"], []string{"A"}) {
+		t.Errorf("alice's vote = %v, want [A] (should be untouched by bob's changes)", byVoter["alice@s.whatsapp.net"])
+	}
+	if !reflect.DeepEqual(byVoter["bob@s.whatsapp.net"], []string{"C"}) {
+		t.Errorf("bob's vote = %v, want [C]", byVoter["bob@s.whatsapp.net"])
+	}
+}
+
+func TestGetPollCurrentVotesUnknownPollReturnsEmptyNotError(t *testing.T) {
+	store := newTestMessageStore(t)
+
+	votes, err := store.GetPollCurrentVotes("never-seen", "chat@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("should not error on an unknown poll, got: %v", err)
+	}
+	if len(votes) != 0 {
+		t.Fatalf("expected no votes for an unknown poll, got %v", votes)
 	}
 }

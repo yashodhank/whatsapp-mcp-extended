@@ -918,6 +918,56 @@ func (s *Server) handleCreatePoll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetPollResults handles GET /api/poll/results for reading a poll's current tally.
+//
+// Query params:
+//   - chat_jid: Chat the poll was sent in (required)
+//   - message_id: The poll creation message's own ID (required)
+//
+// Returns each voter's current selection directly from local state — no need to decrypt
+// anything live or reconstruct it from message history. A voter who retracted their vote is
+// still listed, with an empty selected_options array, distinct from a voter who never voted at
+// all (who simply won't appear).
+//
+// Response: { success, chat_jid, message_id, votes: [{voter_jid, selected_options, vote_timestamp_ms}] }
+func (s *Server) handleGetPollResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		SendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	chatJID := r.URL.Query().Get("chat_jid")
+	messageID := r.URL.Query().Get("message_id")
+	if chatJID == "" || messageID == "" {
+		SendJSONError(w, "chat_jid and message_id are required", http.StatusBadRequest)
+		return
+	}
+
+	votes, err := s.messageStore.GetPollCurrentVotes(messageID, chatJID)
+	if err != nil {
+		SendJSONError(w, fmt.Sprintf("Failed to get poll results: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	results := make([]map[string]interface{}, len(votes))
+	for i, v := range votes {
+		results[i] = map[string]interface{}{
+			"voter_jid":         v.VoterJID,
+			"selected_options":  v.SelectedOptions,
+			"vote_timestamp_ms": v.VoteTimestampMS,
+		}
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"chat_jid":   chatJID,
+		"message_id": messageID,
+		"votes":      results,
+	})
+}
+
 // Phase 4: History Sync
 
 // handleRequestHistory handles POST /api/history for requesting older messages.
@@ -1655,9 +1705,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	startedAt, lastConn, discAt, reconnErrs := s.client.ConnectionState()
 
 	resp := map[string]interface{}{
-		"connected":     connected,
-		"needs_pairing": needsPairing, // true when Store.ID == nil: QR or pairing code required
-		"uptime":        time.Since(startedAt).Round(time.Second).String(),
+		"connected":      connected,
+		"needs_pairing":  needsPairing, // true when Store.ID == nil: QR or pairing code required
+		"uptime":         time.Since(startedAt).Round(time.Second).String(),
 		"reconnect_errs": reconnErrs,
 	}
 	if !lastConn.IsZero() {

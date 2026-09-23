@@ -45,6 +45,18 @@ func (c *Client) resolvePollVoteContent(messageStore *database.MessageStore, msg
 	}
 
 	selected := matchSelectedOptions(options, vote.GetSelectedOptions())
+
+	// Record this as the voter's CURRENT answer, not just a line in the message history: a
+	// history row alone means "what does this poll currently show" requires finding the newest
+	// row per voter yourself. This upsert keeps exactly one row per voter that's always the
+	// latest, ordered by WhatsApp's own SenderTimestampMS so a late-arriving stale vote can never
+	// clobber a newer one. Runs for retractions too (selected == nil) — "voted, now selected
+	// nothing" is a real state, not the same as "never voted."
+	voteTimestampMS := msg.Message.GetPollUpdateMessage().GetSenderTimestampMS()
+	if err := messageStore.UpsertPollCurrentVote(pollMsgID, chatJID, msg.Info.Sender.String(), selected, voteTimestampMS); err != nil {
+		c.logger.Warnf("Failed to record current vote for poll %s: %v", pollMsgID, err)
+	}
+
 	if len(selected) == 0 {
 		// A valid, empty selection is how WhatsApp represents retracting a vote.
 		return "[Poll Vote: retracted]"
