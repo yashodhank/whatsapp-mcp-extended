@@ -1,3 +1,10 @@
+> [!WARNING]
+> **RETIRED (2026-11-07).** This project is archived and no longer maintained.
+> It has been replaced by [GOWA](https://github.com/aldinokemal/go-whatsapp-web-multidevice)
+> (Go WhatsApp REST API with built-in MCP, multi-account, and webhooks).
+> All 46,793 messages and 1,065 chats were migrated to GOWA before retirement.
+> The local deployment, MCP configs, and webhook path now point at GOWA.
+
 # WhatsApp MCP Extended
 
 An extended Model Context Protocol (MCP) server for WhatsApp with a toolset-gated, agent-facing surface for messaging, search, media, group management, webhooks, presence, and more.
