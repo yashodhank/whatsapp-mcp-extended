@@ -65,7 +65,7 @@ class Message:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert Message to dictionary for structured output."""
-        result = {
+        result: dict[str, Any] = {
             "id": self.id,
             "chat_jid": self.chat_jid,
             "chat_name": self.chat_name,
@@ -177,6 +177,14 @@ class MessageContext:
     before: list[Message]
     after: list[Message]
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert MessageContext to dictionary."""
+        return {
+            "message": self.message.to_dict(),
+            "before": [message.to_dict() for message in self.before],
+            "after": [message.to_dict() for message in self.after],
+        }
+
 
 def get_sender_name(sender_jid: str) -> str:
     """Get the best available name for a sender using both contact and chat data."""
@@ -259,7 +267,7 @@ def get_sender_name(sender_jid: str) -> str:
             messages_conn.close()
 
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
+def format_message(message: Message, show_chat_info: bool = True) -> str:
     """Print a single message with consistent formatting."""
     output = ""
 
@@ -280,7 +288,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     return output
 
 
-def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> None:
+def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> str:
     output = ""
     if not messages:
         output += "No messages to display."
@@ -317,7 +325,7 @@ def list_messages(
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
-        params = []
+        params: list[Any] = []
 
         # Add filters
         if after:
@@ -522,7 +530,7 @@ def list_chats(
     page: int = 0,
     include_last_message: bool = True,
     sort_by: str = "last_active",
-) -> list[Chat]:
+) -> list[dict[str, Any]]:
     """Get chats matching the specified criteria."""
     print(f"Debug: Database path: {MESSAGES_DB_PATH}")
     print(f"Debug: Database exists: {os.path.exists(MESSAGES_DB_PATH)}")
@@ -575,7 +583,7 @@ def list_chats(
         ]
 
         where_clauses = []
-        params = []
+        params: list[Any] = []
 
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
@@ -991,6 +999,7 @@ def send_file(
     server's disk, so a path-only interface makes sending it impossible.
     """
     temp_path: str | None = None
+    temp_dir: str | None = None
     try:
         # Validate input
         if not recipient:
@@ -1003,7 +1012,7 @@ def send_file(
             }
 
         if file_content_base64:
-            if not filename:
+            if filename is None:
                 return {
                     "success": False,
                     "error": "filename must be provided with file_content_base64",
@@ -1018,12 +1027,15 @@ def send_file(
             # there first — and somewhere validateMediaPath allows.
             media_dir = os.path.join(MEDIA_TEMP_DIR, "whatsapp-outgoing")
             os.makedirs(media_dir, exist_ok=True)
-            # Only the basename: a filename like "../x" must not escape. The
-            # bridge also rejects any path containing "..", so a traversal
-            # attempt would fail there too.
-            safe_name = os.path.basename(filename) or "upload"
-            fd, temp_path = tempfile.mkstemp(suffix=f"-{safe_name}", dir=media_dir)
-            with os.fdopen(fd, "wb") as f:
+            # Keep the document name exact; put uniqueness in its directory.
+            # Empty names and directory markers must still name a regular file.
+            safe_name = os.path.basename(filename)
+            if safe_name in ("", ".", ".."):
+                safe_name = "upload"
+            temp_dir = tempfile.mkdtemp(dir=media_dir)
+            temp_path = os.path.join(temp_dir, safe_name)
+            with open(temp_path, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
+                os.fchmod(f.fileno(), 0o600)
                 f.write(content)
 
             media_path = temp_path
@@ -1067,6 +1079,11 @@ def send_file(
         if temp_path:
             try:
                 os.remove(temp_path)
+            except OSError:
+                pass
+        if temp_dir:
+            try:
+                os.rmdir(temp_dir)
             except OSError:
                 pass
 
@@ -1218,6 +1235,12 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
+                if path and not os.path.isabs(path):
+                    # The bridge reports media paths relative to its own
+                    # working directory (the bridge's project root, one
+                    # level above WA_STORE_PATH), not this server's cwd.
+                    bridge_root = os.path.dirname(os.path.dirname(MESSAGES_DB_PATH))
+                    path = os.path.join(bridge_root, path)
                 print(f"Media downloaded successfully: {path}")
                 return path
             else:

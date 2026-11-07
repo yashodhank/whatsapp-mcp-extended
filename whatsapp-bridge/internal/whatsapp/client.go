@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,12 +48,13 @@ type Client struct {
 	presence *presenceManager
 
 	// Pairing state
-	pairingMutex      sync.Mutex
-	pairingInProgress bool
-	pairingCode       string
-	pairingExpiry     time.Time
-	pairingComplete   bool
-	pairingError      error
+	pairingMutex       sync.Mutex
+	pairingInProgress  bool
+	pairingCode        string
+	pairingExpiry      time.Time
+	pairingComplete    bool
+	pairingError       error
+	pairingSuccessChan chan struct{}
 
 	// Called just before AutoReconnect circuit breaker gives up (30 consecutive failures).
 	// Use to fire an out-of-band alert before the process exits via watchdog.
@@ -126,12 +128,13 @@ func NewClientWithConfig(logger waLog.Logger, cfg *config.Config) (*Client, erro
 	}
 
 	c := &Client{
-		Client:    client,
-		logger:    logger,
-		cfg:       cfg,
-		startedAt: time.Now(),
-		antiban:   antibanInterceptor,
-		presence:  newPresenceManager(cfg.PresenceMode, cfg.PresenceLingerMin, cfg.PresenceLingerMax),
+		Client:             client,
+		logger:             logger,
+		cfg:                cfg,
+		startedAt:          time.Now(),
+		antiban:            antibanInterceptor,
+		presence:           newPresenceManager(cfg.PresenceMode, cfg.PresenceLingerMin, cfg.PresenceLingerMax),
+		pairingSuccessChan: make(chan struct{}, 1),
 	}
 
 	logger.Infof("Presence mode: %s (linger %v..%v)", cfg.PresenceMode, cfg.PresenceLingerMin, cfg.PresenceLingerMax)
@@ -198,13 +201,20 @@ func (c *Client) Connect() error {
 			}
 		}
 
-		// Wait for connection
+		// Wait for connection (via either QR scan or phone pairing code)
 		select {
 		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			c.MarkDisconnected() // triggers watchdog to restart container
-			return fmt.Errorf("timeout waiting for QR code scan")
+			fmt.Println("\nSuccessfully connected and authenticated via QR code!")
+		case <-c.pairingSuccessChan:
+			fmt.Println("\nSuccessfully connected and authenticated via phone pairing code!")
+		case <-time.After(15 * time.Minute):
+			c.pairingMutex.Lock()
+			inProg := c.pairingInProgress
+			c.pairingMutex.Unlock()
+			if !inProg {
+				c.MarkDisconnected() // triggers watchdog to restart container
+				return fmt.Errorf("timeout waiting for device pairing")
+			}
 		}
 	} else {
 		// Already paired — wait for the Connected event instead of sleeping.
@@ -260,7 +270,7 @@ func (c *Client) SubscribeToPresence(jidStr string) error {
 	if err != nil {
 		return fmt.Errorf("invalid JID: %v", err)
 	}
-	return c.Client.SubscribePresence(context.Background(), jid)
+	return c.SubscribePresence(context.Background(), jid)
 }
 
 // GetProfilePicture retrieves the profile picture URL for a user or group.
@@ -435,7 +445,7 @@ func (c *Client) SetDisappearingTimer(chatJID string, duration string) error {
 // Returns a map of privacy setting categories and their values.
 // Valid values: "all", "contacts", "contact_blacklist", "none", "known", "match_last_seen".
 func (c *Client) GetPrivacySettings() (map[string]string, error) {
-	settings, err := c.Client.TryFetchPrivacySettings(context.Background(), false)
+	settings, err := c.TryFetchPrivacySettings(context.Background(), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch privacy settings: %v", err)
 	}
@@ -463,7 +473,7 @@ func (c *Client) PinChat(chatJID string) error {
 	}
 
 	patch := appstate.BuildPin(jid, true)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // UnpinChat unpins a chat from the top of the chat list.
@@ -474,7 +484,7 @@ func (c *Client) UnpinChat(chatJID string) error {
 	}
 
 	patch := appstate.BuildPin(jid, false)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // MuteChat mutes a chat for the specified duration.
@@ -502,7 +512,7 @@ func (c *Client) MuteChat(chatJID string, duration string) error {
 	}
 
 	patch := appstate.BuildMute(jid, true, muteDuration)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // UnmuteChat unmutes a chat.
@@ -513,7 +523,7 @@ func (c *Client) UnmuteChat(chatJID string) error {
 	}
 
 	patch := appstate.BuildMute(jid, false, 0)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // ArchiveChat archives a chat.
@@ -524,7 +534,7 @@ func (c *Client) ArchiveChat(chatJID string) error {
 	}
 
 	patch := appstate.BuildArchive(jid, true, time.Time{}, nil)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // UnarchiveChat unarchives a chat.
@@ -535,7 +545,7 @@ func (c *Client) UnarchiveChat(chatJID string) error {
 	}
 
 	patch := appstate.BuildArchive(jid, false, time.Time{}, nil)
-	return c.Client.SendAppState(context.Background(), patch)
+	return c.SendAppState(context.Background(), patch)
 }
 
 // Connection state tracking methods
@@ -572,8 +582,25 @@ func (c *Client) PairWithPhone(phoneNumber string) (string, error) {
 	c.pairingMutex.Lock()
 	defer c.pairingMutex.Unlock()
 
+	cleanPhone := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phoneNumber)
+	if cleanPhone == "" {
+		return "", fmt.Errorf("invalid phone number: must contain digits")
+	}
+
 	if c.pairingInProgress {
-		return "", fmt.Errorf("pairing already in progress")
+		// If code has expired or was requested more than 30 seconds ago, allow a fresh retry
+		if time.Now().After(c.pairingExpiry) || time.Until(c.pairingExpiry) < 130*time.Second {
+			c.logger.Infof("Resetting previous pairing state to allow fresh attempt")
+			c.pairingInProgress = false
+			c.pairingCode = ""
+		} else {
+			return "", fmt.Errorf("pairing already in progress — current code is active, please enter it on your phone or wait %d seconds", int(time.Until(c.pairingExpiry).Seconds()))
+		}
 	}
 
 	if c.Store.ID != nil {
@@ -593,8 +620,8 @@ func (c *Client) PairWithPhone(phoneNumber string) (string, error) {
 		}
 	}
 
-	// Request pairing code
-	code, err := c.Client.PairPhone(context.Background(), phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	// Request pairing code using clean digits-only phone
+	code, err := c.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		c.pairingInProgress = false
 		return "", fmt.Errorf("failed to request pairing code: %v", err)
@@ -603,8 +630,31 @@ func (c *Client) PairWithPhone(phoneNumber string) (string, error) {
 	c.pairingCode = code
 	c.pairingExpiry = time.Now().Add(160 * time.Second)
 
-	c.logger.Infof("Pairing code generated: %s (expires in 160s)", code)
+	// Launch background expiry timer so state is automatically unlocked after 165s
+	go func(exp time.Time) {
+		time.Sleep(165 * time.Second)
+		c.pairingMutex.Lock()
+		if c.pairingExpiry.Equal(exp) && !c.pairingComplete {
+			c.pairingInProgress = false
+			c.pairingCode = ""
+			c.logger.Infof("Pairing code expired, state reset for new attempts")
+		}
+		c.pairingMutex.Unlock()
+	}(c.pairingExpiry)
+
+	c.logger.Infof("Pairing code generated: %s for phone %s (expires in 160s)", code, cleanPhone)
 	return code, nil
+}
+
+// ResetPairing manually resets pairing state
+func (c *Client) ResetPairing() {
+	c.pairingMutex.Lock()
+	defer c.pairingMutex.Unlock()
+	c.pairingInProgress = false
+	c.pairingCode = ""
+	c.pairingExpiry = time.Time{}
+	c.pairingError = nil
+	c.logger.Infof("Pairing state manually reset")
 }
 
 // GetPairingStatus returns current pairing state
@@ -617,6 +667,10 @@ func (c *Client) GetPairingStatus() (inProgress bool, code string, expiresIn int
 		remaining := time.Until(c.pairingExpiry)
 		if remaining > 0 {
 			expiresInSec = int(remaining.Seconds())
+		} else {
+			// Expired
+			c.pairingInProgress = false
+			c.pairingCode = ""
 		}
 	}
 
@@ -626,20 +680,24 @@ func (c *Client) GetPairingStatus() (inProgress bool, code string, expiresIn int
 // HandlePairingSuccess called when pairing succeeds
 func (c *Client) HandlePairingSuccess() {
 	c.pairingMutex.Lock()
-	defer c.pairingMutex.Unlock()
-
 	c.pairingComplete = true
 	c.pairingInProgress = false
+	c.pairingCode = ""
+	c.pairingMutex.Unlock()
 	c.logger.Infof("Pairing successful!")
+	select {
+	case c.pairingSuccessChan <- struct{}{}:
+	default:
+	}
 }
 
 // HandlePairingError called when pairing fails
 func (c *Client) HandlePairingError(err error) {
 	c.pairingMutex.Lock()
-	defer c.pairingMutex.Unlock()
-
 	c.pairingError = err
 	c.pairingInProgress = false
+	c.pairingCode = ""
+	c.pairingMutex.Unlock()
 	c.logger.Errorf("Pairing failed: %v", err)
 }
 

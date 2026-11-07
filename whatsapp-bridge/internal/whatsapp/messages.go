@@ -75,6 +75,26 @@ func mediaTypeAndMimeType(mediaPath string) (whatsmeow.MediaType, string) {
 	}
 }
 
+// setAudioMessageMetadata keeps ordinary audio files distinct from voice notes.
+// Only Ogg/Opus voice notes use the existing duration and waveform analysis.
+func setAudioMessageMetadata(audio *waE2E.AudioMessage, mimeType string, mediaData []byte) error {
+	audio.PTT = proto.Bool(false)
+	audio.Seconds = nil
+	audio.Waveform = nil
+	if mimeType != "audio/ogg; codecs=opus" && mimeType != "audio/opus" {
+		return nil
+	}
+
+	seconds, waveform, err := AnalyzeOggOpus(mediaData)
+	if err != nil {
+		return fmt.Errorf("failed to analyze Ogg Opus file: %w", err)
+	}
+	audio.PTT = proto.Bool(true)
+	audio.Seconds = proto.Uint32(seconds)
+	audio.Waveform = waveform
+	return nil
+}
+
 func documentFileName(mediaPath string) string {
 	return filepath.Base(strings.ReplaceAll(mediaPath, "\\", "/"))
 }
@@ -283,22 +303,7 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaAudio:
-			// Handle ogg audio files
-			var seconds uint32 = 30 // Default fallback
-			var waveform []byte = nil
-
-			// Try to analyze the ogg file
-			if strings.Contains(mimeType, "ogg") {
-				analyzedSeconds, analyzedWaveform, err := AnalyzeOggOpus(mediaData)
-				if err == nil {
-					seconds = analyzedSeconds
-					waveform = analyzedWaveform
-				} else {
-					return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)}
-				}
-			}
-
-			msg.AudioMessage = &waE2E.AudioMessage{
+			audio := &waE2E.AudioMessage{
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
 				DirectPath:    &resp.DirectPath,
@@ -306,10 +311,11 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
-				Seconds:       proto.Uint32(seconds),
-				PTT:           proto.Bool(true),
-				Waveform:      waveform,
 			}
+			if err := setAudioMessageMetadata(audio, mimeType, mediaData); err != nil {
+				return bridgeTypes.SendResult{Success: false, Error: err.Error()}
+			}
+			msg.AudioMessage = audio
 		case whatsmeow.MediaVideo:
 			msg.VideoMessage = &waE2E.VideoMessage{
 				Caption:       proto.String(message),
@@ -580,7 +586,7 @@ func (c *Client) SendReaction(messageStore *database.MessageStore, chatJID, mess
 		}
 	}
 
-	msg := c.Client.BuildReaction(chat, senderJID, msgID, emoji)
+	msg := c.BuildReaction(chat, senderJID, msgID, emoji)
 
 	if err := c.antiban.BeforeSend(context.Background(), antiban.Reaction, 0); err != nil {
 		return fmt.Errorf("antiban blocked reaction: %v", err)
@@ -613,7 +619,7 @@ func (c *Client) EditMessage(chatJID, messageID, newContent string) error {
 	newMsg := &waE2E.Message{
 		Conversation: proto.String(newContent),
 	}
-	msg := c.Client.BuildEdit(chat, msgID, newMsg)
+	msg := c.BuildEdit(chat, msgID, newMsg)
 
 	if c.antiban.Enabled() {
 		_ = c.SendTypingIndicator(chatJID, "typing")
@@ -658,7 +664,7 @@ func (c *Client) DeleteMessage(chatJID, messageID, senderJID string) error {
 		}
 	}
 
-	msg := c.Client.BuildRevoke(chat, sender, msgID)
+	msg := c.BuildRevoke(chat, sender, msgID)
 
 	if err := c.antiban.BeforeSend(context.Background(), antiban.Delete, 0); err != nil {
 		return fmt.Errorf("antiban blocked delete: %v", err)
@@ -728,7 +734,7 @@ func (c *Client) markMessages(chatJID string, messageIDs []string, senderJID str
 		}
 	}
 
-	return c.Client.MarkRead(context.Background(), ids, time.Now(), chat, sender, receiptType)
+	return c.MarkRead(context.Background(), ids, time.Now(), chat, sender, receiptType)
 }
 
 // Phase 2: Group Management
@@ -777,7 +783,7 @@ func (c *Client) AddGroupParticipants(groupJID string, participants []string) ([
 		participantJIDs[i] = jid
 	}
 
-	return c.Client.UpdateGroupParticipants(context.Background(), group, participantJIDs, whatsmeow.ParticipantChangeAdd)
+	return c.UpdateGroupParticipants(context.Background(), group, participantJIDs, whatsmeow.ParticipantChangeAdd)
 }
 
 // RemoveGroupParticipants removes members from a group
@@ -800,7 +806,7 @@ func (c *Client) RemoveGroupParticipants(groupJID string, participants []string)
 		participantJIDs[i] = jid
 	}
 
-	return c.Client.UpdateGroupParticipants(context.Background(), group, participantJIDs, whatsmeow.ParticipantChangeRemove)
+	return c.UpdateGroupParticipants(context.Background(), group, participantJIDs, whatsmeow.ParticipantChangeRemove)
 }
 
 // PromoteGroupParticipant promotes a participant to admin
@@ -819,7 +825,7 @@ func (c *Client) PromoteGroupParticipant(groupJID string, participant string) ([
 		return nil, fmt.Errorf("invalid participant JID: %v", err)
 	}
 
-	return c.Client.UpdateGroupParticipants(context.Background(), group, []types.JID{jid}, whatsmeow.ParticipantChangePromote)
+	return c.UpdateGroupParticipants(context.Background(), group, []types.JID{jid}, whatsmeow.ParticipantChangePromote)
 }
 
 // DemoteGroupParticipant demotes an admin to regular participant
@@ -838,7 +844,7 @@ func (c *Client) DemoteGroupParticipant(groupJID string, participant string) ([]
 		return nil, fmt.Errorf("invalid participant JID: %v", err)
 	}
 
-	return c.Client.UpdateGroupParticipants(context.Background(), group, []types.JID{jid}, whatsmeow.ParticipantChangeDemote)
+	return c.UpdateGroupParticipants(context.Background(), group, []types.JID{jid}, whatsmeow.ParticipantChangeDemote)
 }
 
 // LeaveGroup leaves a WhatsApp group
@@ -885,8 +891,13 @@ func (c *Client) SetGroupTopic(groupJID string, topic string) error {
 
 // Phase 3: Polls
 
-// CreatePoll creates and sends a poll to a chat
-func (c *Client) CreatePoll(chatJID string, question string, options []string, multiSelect bool) (bridgeTypes.SendResult, error) {
+// CreatePoll creates and sends a poll to a chat, and stores the poll (with its option list)
+// locally so that votes on it can later be decrypted and resolved back to readable option text —
+// see resolvePollVoteContent in polls.go. A poll this bridge sends never comes back to it as an
+// incoming event (self-echo only happens across other linked devices), so this is the only place
+// that poll's options are ever captured; skipping it means every future vote on this poll decrypts
+// successfully but can't be matched to an option name.
+func (c *Client) CreatePoll(messageStore *database.MessageStore, chatJID string, question string, options []string, multiSelect bool) (bridgeTypes.SendResult, error) {
 	if !c.IsConnected() {
 		return bridgeTypes.SendResult{Success: false, Error: "not connected to WhatsApp"}, fmt.Errorf("not connected to WhatsApp")
 	}
@@ -905,7 +916,7 @@ func (c *Client) CreatePoll(chatJID string, question string, options []string, m
 	}
 
 	// Build poll creation message
-	pollMsg := c.Client.BuildPollCreation(question, options, selectableCount)
+	pollMsg := c.BuildPollCreation(question, options, selectableCount)
 
 	// Antiban: typing indicator + rate limit
 	if c.antiban.Enabled() {
@@ -925,9 +936,24 @@ func (c *Client) CreatePoll(chatJID string, question string, options []string, m
 	}
 	c.antiban.AfterSend(antiban.Poll)
 
+	msgID := string(resp.ID)
+	if err := messageStore.StorePollOptions(msgID, chatJID, options); err != nil {
+		c.logger.Warnf("Failed to store poll options for %s: %v", msgID, err)
+	}
+	var ownJID string
+	if c.Store != nil && c.Store.ID != nil {
+		ownJID = c.Store.ID.ToNonAD().String()
+	}
+	if err := messageStore.StoreMessage(
+		msgID, chatJID, ownJID, "", fmt.Sprintf("[Poll: %s]", question),
+		resp.Timestamp, true, "", "", "", "", nil, nil, nil, 0,
+	); err != nil {
+		c.logger.Warnf("Failed to store sent poll message %s: %v", msgID, err)
+	}
+
 	return bridgeTypes.SendResult{
 		Success:   true,
-		MessageID: string(resp.ID),
+		MessageID: msgID,
 		Timestamp: resp.Timestamp,
 	}, nil
 }
@@ -961,16 +987,16 @@ func (c *Client) RequestChatHistory(chatJID string, oldestMsgID string, oldestMs
 
 	// Set sender correctly: fromMe uses own JID, incoming uses provided sender JID
 	if oldestMsgFromMe {
-		msgInfo.MessageSource.Sender = ownJID
+		msgInfo.Sender = ownJID
 	} else if oldestMsgSender != "" {
 		senderJID, parseErr := types.ParseJID(oldestMsgSender)
 		if parseErr == nil {
-			msgInfo.MessageSource.Sender = senderJID
+			msgInfo.Sender = senderJID
 		} else {
-			msgInfo.MessageSource.Sender = ownJID
+			msgInfo.Sender = ownJID
 		}
 	} else {
-		msgInfo.MessageSource.Sender = ownJID
+		msgInfo.Sender = ownJID
 	}
 
 	// Build the history sync request
@@ -979,7 +1005,7 @@ func (c *Client) RequestChatHistory(chatJID string, oldestMsgID string, oldestMs
 		count = 50
 	}
 
-	msg := c.Client.BuildHistorySyncRequest(msgInfo, count)
+	msg := c.BuildHistorySyncRequest(msgInfo, count)
 
 	// Send as peer message to own device (NOT to the group/chat).
 	// History sync is a device-to-device protocol request to our own phone.
