@@ -445,6 +445,112 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 	}
 }
 
+// PostStatus posts a status broadcast (text and/or media) to the user's WhatsApp
+// status audience. Unlike SendMessage, the recipient is always status@broadcast;
+// whatsmeow resolves the audience from the account's status privacy settings.
+func (c *Client) PostStatus(messageStore *database.MessageStore, message string, mediaPath string) bridgeTypes.SendResult {
+	if !c.IsConnected() {
+		return bridgeTypes.SendResult{Success: false, Error: "Not connected to WhatsApp"}
+	}
+
+	c.GoOnlineBriefly()
+
+	msg := &waE2E.Message{}
+
+	if mediaPath != "" {
+		if err := validateMediaPath(mediaPath); err != nil {
+			return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Invalid media path: %v", err)}
+		}
+
+		mediaData, err := os.ReadFile(mediaPath)
+		if err != nil {
+			return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Error reading media file: %v", err)}
+		}
+
+		mediaType, mimeType := mediaTypeAndMimeType(mediaPath)
+		resp, err := c.Upload(context.Background(), mediaData, mediaType)
+		if err != nil {
+			return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Error uploading media: %v", err)}
+		}
+
+		switch mediaType {
+		case whatsmeow.MediaImage:
+			msg.ImageMessage = &waE2E.ImageMessage{
+				Caption:       proto.String(message),
+				Mimetype:      proto.String(mimeType),
+				URL:           &resp.URL,
+				DirectPath:    &resp.DirectPath,
+				MediaKey:      resp.MediaKey,
+				FileEncSHA256: resp.FileEncSHA256,
+				FileSHA256:    resp.FileSHA256,
+				FileLength:    &resp.FileLength,
+			}
+		case whatsmeow.MediaVideo:
+			msg.VideoMessage = &waE2E.VideoMessage{
+				Caption:       proto.String(message),
+				Mimetype:      proto.String(mimeType),
+				URL:           &resp.URL,
+				DirectPath:    &resp.DirectPath,
+				MediaKey:      resp.MediaKey,
+				FileEncSHA256: resp.FileEncSHA256,
+				FileSHA256:    resp.FileSHA256,
+				FileLength:    &resp.FileLength,
+			}
+		default:
+			return bridgeTypes.SendResult{Success: false, Error: "Status supports only image or video media"}
+		}
+	} else {
+		if message == "" {
+			return bridgeTypes.SendResult{Success: false, Error: "Message or media path is required"}
+		}
+		msg.Conversation = proto.String(message)
+	}
+
+	// Antiban: a status post is still an outbound send, so respect the rate limit.
+	if err := c.antiban.BeforeSend(context.Background(), antiban.Text, len(message)); err != nil {
+		return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("antiban blocked status: %v", err)}
+	}
+
+	sendResp, err := c.Client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+	if err != nil {
+		c.antiban.AfterSendFailed(antiban.Text, err)
+		return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Error posting status: %v", err)}
+	}
+	c.antiban.AfterSend(antiban.Text)
+
+	if messageStore != nil {
+		sender := ""
+		if c.Store != nil && c.Store.ID != nil {
+			sender = c.Store.ID.ToNonAD().String()
+		}
+		content := ExtractTextContent(msg)
+		mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := ExtractMediaInfo(msg)
+		_ = messageStore.StoreMessage(
+			string(sendResp.ID),
+			types.StatusBroadcastJID.String(),
+			sender,
+			sender,
+			content,
+			sendResp.Timestamp,
+			true,
+			mediaType,
+			filename,
+			url,
+			directPath,
+			mediaKey,
+			fileSHA256,
+			fileEncSHA256,
+			fileLength,
+		)
+	}
+
+	return bridgeTypes.SendResult{
+		Success:   true,
+		MessageID: string(sendResp.ID),
+		Timestamp: sendResp.Timestamp,
+	}
+}
+
 // SendReaction sends an emoji reaction to a message.
 // It looks up the original message sender from the store so that
 // BuildReaction constructs the correct MessageKey (FromMe flag).

@@ -273,6 +273,14 @@ type SendMessageResponse struct {
 	Recipient string    `json:"recipient,omitempty"`
 }
 
+// PostStatusRequest represents the request body for the post status API.
+// A status is a broadcast to the user's status audience (status@broadcast),
+// not a message to a single chat.
+type PostStatusRequest struct {
+	Message   string `json:"message"`
+	MediaPath string `json:"media_path,omitempty"`
+}
+
 // SendResult contains the result of sending a message (internal use)
 type SendResult struct {
 	Success   bool

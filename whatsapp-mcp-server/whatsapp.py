@@ -131,15 +131,11 @@ def _resolve_equivalent_jids(jid: str) -> list[str]:
         conn = sqlite3.connect(WHATSAPP_DB_PATH)
         cursor = conn.cursor()
         if suffix == "s.whatsapp.net":
-            row = cursor.execute(
-                "SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (bare,)
-            ).fetchone()
+            row = cursor.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (bare,)).fetchone()
             if row:
                 return [jid, f"{row[0]}@lid"]
         else:
-            row = cursor.execute(
-                "SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (bare,)
-            ).fetchone()
+            row = cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (bare,)).fetchone()
             if row:
                 return [jid, f"{row[0]}@s.whatsapp.net"]
         return [jid]
@@ -1068,6 +1064,85 @@ def send_file(
     finally:
         # The bridge reads the file synchronously during /send, so it is safe to
         # remove once that call has returned either way.
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def post_status(
+    message: str = "",
+    media_path: str | None = None,
+    file_content_base64: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Post a WhatsApp status broadcast (text and/or media).
+
+    A status is a broadcast to the user's status audience, not a message to a
+    single chat. Accepts either a path on this server's filesystem, or the
+    file's bytes as base64 (same contract as send_file).
+    """
+    temp_path: str | None = None
+    try:
+        if media_path and file_content_base64:
+            return {
+                "success": False,
+                "error": "Provide either media_path or file_content_base64, not both",
+            }
+
+        if file_content_base64:
+            if not filename:
+                return {
+                    "success": False,
+                    "error": "filename must be provided with file_content_base64",
+                }
+
+            try:
+                content = base64.b64decode(file_content_base64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                return {"success": False, "error": f"Invalid base64 content: {str(e)}"}
+
+            media_dir = os.path.join(MEDIA_TEMP_DIR, "whatsapp-outgoing")
+            os.makedirs(media_dir, exist_ok=True)
+            safe_name = os.path.basename(filename) or "upload"
+            fd, temp_path = tempfile.mkstemp(suffix=f"-{safe_name}", dir=media_dir)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+            media_path = temp_path
+
+        if not message and not media_path:
+            return {"success": False, "error": "Message or media_path must be provided"}
+
+        if media_path and not os.path.isfile(media_path):
+            return {"success": False, "error": f"Media file not found: {media_path}"}
+
+        url = f"{WHATSAPP_API_BASE_URL}/status"
+        payload: dict[str, Any] = {"message": message}
+        if media_path:
+            payload["media_path"] = media_path
+
+        response = requests.post(url, json=payload, headers=_get_headers(), timeout=30)
+
+        if response.status_code == 200:
+            result = response.json()
+            return {
+                "success": result.get("success", False),
+                "message_id": result.get("message_id"),
+                "timestamp": result.get("timestamp"),
+                "recipient": result.get("recipient"),
+                "error": result.get("message") if not result.get("success") else None,
+            }
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code} - {response.text}"}
+
+    except requests.RequestException as e:
+        return {"success": False, "error": f"Request error: {str(e)}"}
+    except json.JSONDecodeError:
+        return {"success": False, "error": f"Error parsing response: {response.text}"}
+    except Exception as e:
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+    finally:
         if temp_path:
             try:
                 os.remove(temp_path)

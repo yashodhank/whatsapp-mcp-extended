@@ -9,6 +9,7 @@ DEFAULT_TOOLS = {
     "get_message_context",
     "send_message",
     "send_file",
+    "post_status",
     "send_audio_message",
     "download_media",
     "list_all_contacts",
