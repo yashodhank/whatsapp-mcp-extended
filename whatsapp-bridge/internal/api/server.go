@@ -57,6 +57,7 @@ func (s *Server) registerHandlers() {
 
 	// Message operations endpoints
 	http.HandleFunc("/api/send", SecureMiddleware(s.handleSendMessage))
+	http.HandleFunc("/api/status", SecureMiddleware(s.handlePostStatus))
 	http.HandleFunc("/api/messages", SecureMiddleware(s.handleGetMessages))
 	http.HandleFunc("/api/chats", SecureMiddleware(s.handleGetChats))
 

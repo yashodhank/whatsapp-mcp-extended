@@ -72,6 +72,51 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePostStatus handles POST /api/status for posting a WhatsApp status broadcast.
+//
+// Request body:
+//   - message: Caption / text content (required if media_path not provided)
+//   - media_path: Path to an image or video file (optional)
+//
+// Response:
+//   - success: boolean
+//   - message_id: string (WhatsApp message ID on success)
+//   - timestamp: int64 (Unix timestamp)
+//   - recipient: string ("status@broadcast")
+//   - error: string (on failure)
+func (s *Server) handlePostStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		SendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req types.PostStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		SendJSONError(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+
+	if req.Message == "" && req.MediaPath == "" {
+		SendJSONError(w, "Message or media path is required", http.StatusBadRequest)
+		return
+	}
+
+	result := s.client.PostStatus(s.messageStore, req.Message, req.MediaPath)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !result.Success {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+
+	_ = json.NewEncoder(w).Encode(types.SendMessageResponse{
+		Success:   result.Success,
+		Message:   result.Error,
+		MessageID: result.MessageID,
+		Timestamp: result.Timestamp,
+		Recipient: "status@broadcast",
+	})
+}
+
 // handleWebhooks handles GET/POST /api/webhooks for webhook management.
 //
 // GET: List all webhook configurations (secrets are masked)

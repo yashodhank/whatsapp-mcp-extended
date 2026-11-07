@@ -41,6 +41,7 @@ from whatsapp import list_chats as whatsapp_list_chats
 from whatsapp import list_contact_nicknames as whatsapp_list_contact_nicknames
 from whatsapp import list_messages as whatsapp_list_messages
 from whatsapp import mark_messages_read as whatsapp_mark_messages_read
+from whatsapp import post_status as whatsapp_post_status
 from whatsapp import promote_to_admin as whatsapp_promote_to_admin
 from whatsapp import remove_contact_nickname as whatsapp_remove_contact_nickname
 from whatsapp import remove_group_members as whatsapp_remove_group_members
@@ -322,6 +323,36 @@ def send_file(
           file_content_base64 with a filename
     """
     return whatsapp_send_file(recipient, media_path, file_content_base64, filename)
+
+
+@tool("media", "Post Status", read_only=False)
+def post_status(
+    message: str = "",
+    media_path: str | None = None,
+    file_content_base64: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Post a WhatsApp status broadcast (text and/or media) to your status audience.
+
+    A status is a broadcast to the people allowed by your status privacy settings,
+    not a message to a single chat. Provide text, media, or both.
+
+    Args:
+        message: Caption / text content for the status (optional if media is provided)
+        media_path: The absolute path to an image or video file on the *server*
+        file_content_base64: The file's bytes, base64-encoded. Use this for a local file —
+                 the server cannot read your filesystem. Requires filename.
+        filename: Name for the file, including extension (e.g. "diwali.png"). Required
+                 with file_content_base64; the extension determines how WhatsApp shows it.
+
+    Returns:
+        A dictionary containing success status, message_id, timestamp and recipient
+
+    Hints:
+        - Status supports image and video media only
+        - Exactly one of media_path or file_content_base64 is required when sending media
+    """
+    return whatsapp_post_status(message, media_path, file_content_base64, filename)
 
 
 @tool("media", "Send Audio Message", read_only=False)

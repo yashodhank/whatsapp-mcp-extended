@@ -98,7 +98,7 @@ Toolsets:
 |---------|---------|-------|
 | `core` | Yes | Search/read tools, contact context, group info, profile picture |
 | `send` | Yes | `send_message`, `send_reaction`, `create_poll` |
-| `media` | Yes | `send_file`, `send_audio_message`, `download_media` |
+| `media` | Yes | `send_file`, `post_status`, `send_audio_message`, `download_media` |
 | `history` | No | `request_history` |
 | `contacts_write` | No | `manage_nickname` |
 | `message_admin` | No | `edit_message`, `delete_message`, `mark_read` |
@@ -126,6 +126,7 @@ Migration:
 |------|-------------|
 | `send_message` | Send text message (supports optional `quoted_message_id` to reply/quote) |
 | `send_file` | Send image/video/document |
+| `post_status` | Post a status broadcast (text and/or image/video) to your status audience |
 | `send_audio_message` | Send voice message |
 | `download_media` | Download received media |
 | `send_reaction` | React to message with emoji |
